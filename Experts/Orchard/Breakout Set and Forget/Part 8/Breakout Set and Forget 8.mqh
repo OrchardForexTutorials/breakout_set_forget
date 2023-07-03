@@ -29,12 +29,11 @@
 
 #define app_copyright "Copyright 2023, Orchard Forex"
 #define app_link      "https://www.orchardforex.com"
-#define app_version   "6.00"
+#define app_version   "8.00"
 
 #ifdef __MQL5__
 #include <Trade/Trade.mqh>
-CTrade        Trade;
-CPositionInfo PositionInfo;
+CTrade Trade;
 #endif
 
 enum ENUM_RISK_TYPE
@@ -58,6 +57,9 @@ input double         InpTakeProfit1Pips  = 15.0; // Take profit 1 pips
 input double         InpTakeProfit2Pips  = 35.0; // Take profit 2 pips
 input double         InpTakeProfit3Pips  = 50.0; // Take profit 3 pips
 
+// Management features
+input bool           InpUseBreakEven     = false; // Move to break even on first TP
+
 // Standard features
 input long           InpMagic            = 232323;               // Magic number
 input string         InpTradeComment     = "SnF Breakout";       // Trade comment
@@ -77,9 +79,13 @@ datetime             StartTime           = 0;
 datetime             EndTime             = 0;
 bool                 InRange             = false;
 
+long                 Magic1              = 0;
+long                 Magic2              = 0;
+
 double               BuyEntryPrice       = 0;
 double               SellEntryPrice      = 0;
 
+int                  PositionCount       = 0;
 ;
 //+------------------------------------------------------------------+
 //| Expert initialization function                                   |
@@ -150,28 +156,34 @@ int OnInit() {
    BuyEntryPrice  = 0;
    SellEntryPrice = 0;
 
-#ifdef __MQL5__
-   Trade.SetExpertMagicNumber( InpMagic );
-#endif
+   // Not with 3 magics
+   //#ifdef __MQL5__
+   //   Trade.SetExpertMagicNumber( InpMagic );
+   //#endif
 
    // First find the setup for the starting time range
-   datetime now = TimeCurrent();
-   EndTime      = SetNextTime( now + 60, InpRangeEndHour, InpRangeEndMinute );
-   StartTime    = SetPrevTime( EndTime, InpRangeStartHour, InpRangeStartMinute );
-   InRange      = ( StartTime <= now && EndTime > now );
+   datetime now   = TimeCurrent();
+   EndTime        = SetNextTime( now + 60, InpRangeEndHour, InpRangeEndMinute );
+   StartTime      = SetPrevTime( EndTime, InpRangeStartHour, InpRangeStartMinute );
+   InRange        = ( StartTime <= now && EndTime > now );
+
+   Magic1         = InpMagic;
+   Magic2         = Magic1 + 1;
+
+   // In case a trade has closed while shut down
+   PositionCount  = 0;
+   UpdateBreakEven();
 
    return ( INIT_SUCCEEDED );
 }
 
-//+------------------------------------------------------------------+
-//| Expert deinitialization function                                 |
-//+------------------------------------------------------------------+
 void OnDeinit( const int reason ) {}
 
-//+------------------------------------------------------------------+
-//| Expert tick function                                             |
-//+------------------------------------------------------------------+
 void OnTick() {
+
+   if ( PositionsTotal() != PositionCount ) {
+      UpdateBreakEven();
+   }
 
    datetime now              = TimeCurrent();
    bool     currentlyInRange = ( StartTime <= now && now < EndTime );
@@ -287,12 +299,12 @@ void OpenTrade( ENUM_ORDER_TYPE type, double price ) {
       sl = price + StopLoss;
    }
 
-   if ( !OpenTrade( type, price, sl, TakeProfit1 ) ) return;
-   if ( !OpenTrade( type, price, sl, TakeProfit2 ) ) return;
-   if ( !OpenTrade( type, price, sl, TakeProfit3 ) ) return;
+   if ( !OpenTrade( type, price, sl, TakeProfit1, Magic1 ) ) return;
+   if ( !OpenTrade( type, price, sl, TakeProfit2, Magic2 ) ) return;
+   if ( !OpenTrade( type, price, sl, TakeProfit3, Magic2 ) ) return;
 }
 
-bool OpenTrade( ENUM_ORDER_TYPE type, double price, double sl, double takeProfit ) {
+bool OpenTrade( ENUM_ORDER_TYPE type, double price, double sl, double takeProfit, long magic ) {
 
    // 1. allow 0 take profit
    if ( takeProfit == 0 ) return true;
@@ -321,7 +333,7 @@ bool OpenTrade( ENUM_ORDER_TYPE type, double price, double sl, double takeProfit
    }
 
 #ifdef __MQL4__
-   int ticket = OrderSend( Symbol(), type, volume, price, 0, sl, tp, InpTradeComment, ( int )InpMagic );
+   int ticket = OrderSend( Symbol(), type, volume, price, 0, sl, tp, InpTradeComment, ( int )magic );
    if ( ticket <= 0 ) {
       PrintFormat( "Error opening trade, type=%s, volume=%f, price=%f, sl=%f, tp=%f", EnumToString( type ), volume, price, sl, tp );
       return false;
@@ -329,6 +341,7 @@ bool OpenTrade( ENUM_ORDER_TYPE type, double price, double sl, double takeProfit
 #endif
 
 #ifdef __MQL5__
+   Trade.SetExpertMagicNumber( magic );
    if ( !Trade.PositionOpen( Symbol(), type, volume, price, sl, tp, InpTradeComment ) ) {
       PrintFormat( "Error opening trade, type=%s, volume=%f, price=%f, sl=%f, tp=%f", EnumToString( type ), volume, price, sl, tp );
       return false;
@@ -370,3 +383,109 @@ double NormaliseVolume( double volume ) {
 
    return result;
 }
+
+// Move trades to b/e at trigger price
+void UpdateBreakEven() {
+
+   if ( !InpUseBreakEven ) return;
+
+   for ( int i = PositionsTotal() - 1; i >= 0; i-- ) {
+
+      if ( !PositionSelectByIndex( i, Magic2 ) ) continue;       // Only select the secondary trades
+      if ( PositionStopLoss() == PositionPriceOpen() ) continue; // already at b/e
+
+      datetime timeOpen   = PositionTimeOpen();
+
+      // Capture these because the IsPrimaryOpen fn will change
+      //		the selected position
+      long     ticket     = PositionTicket();
+      double   priceOpen  = PositionPriceOpen();
+      double   takeProfit = PositionTakeProfit();
+
+      // Find the primary trade if it still exists
+      if ( !IsPrimaryOpen( timeOpen ) ) { // Note the ! here, looking for no primary
+         SetBreakEven( ticket, priceOpen, takeProfit );
+      }
+   }
+
+   PositionCount = PositionsTotal();
+}
+
+bool IsPrimaryOpen( datetime timeOpen ) {
+
+   // Find the primary trade if it still exists
+   bool primaryOpen = false;
+   for ( int i = PositionsTotal() - 1; i >= 0; i-- ) {
+
+      // If a trade matches magic and time open then found
+      if ( PositionSelectByIndex( i, Magic1, timeOpen ) ) return true;
+   }
+
+   return false; // No current primary trade
+}
+
+void SetBreakEven( long ticket, double priceOpen, double takeProfit ) {
+
+// Now just update the stop loss
+#ifdef __MQL4__
+   bool success = OrderModify( ( int )ticket, priceOpen, priceOpen, takeProfit, 0 );
+#endif
+#ifdef __MQL5__
+   Trade.PositionModify( ticket, priceOpen, takeProfit );
+#endif
+}
+
+bool PositionSelectByIndex( int index, long magic, datetime groupTime ) {
+
+   if ( !PositionSelectByIndex( index, magic ) ) return false;
+   if ( MathAbs( PositionTimeOpen() - groupTime ) > 300 ) return false;
+   return true;
+}
+
+#ifdef __MQL4__
+bool PositionSelectByIndex( int index, long magic ) {
+
+   if ( !OrderSelect( index, SELECT_BY_POS, MODE_TRADES ) ) return false;
+   if ( OrderSymbol() != Symbol() ) return false;
+   if ( OrderMagicNumber() != magic ) return false;
+   if ( OrderType() != ORDER_TYPE_BUY && OrderType() != ORDER_TYPE_SELL ) return false;
+   return true;
+}
+
+// for easier compatibility
+int      PositionsTotal() { return OrdersTotal(); }
+double   PositionStopLoss() { return OrderStopLoss(); }
+double   PositionPriceOpen() { return OrderOpenPrice(); }
+int      PositionTicket() { return OrderTicket(); }
+datetime PositionTimeOpen() { return OrderOpenTime(); }
+double   PositionTakeProfit() { return OrderTakeProfit(); }
+int      PositionType() { return OrderType(); }
+long     PositionMagic() { return OrderMagicNumber(); }
+
+#endif
+
+#ifdef __MQL5__
+
+bool PositionSelectByIndex( int index, long magic ) {
+
+   ulong ticket = PositionGetTicket( index );
+   if ( ticket <= 0 ) return false;
+   if ( PositionSymbol() != Symbol() ) return false;
+   if ( PositionMagic() != magic ) return false;
+
+   return true;
+}
+
+// Some to make compatibility easier
+// There are native PositionGet... fns for these but I'll use the object
+
+long     PositionMagic() { return PositionGetInteger( POSITION_MAGIC ); }
+double   PositionPriceOpen() { return PositionGetDouble( POSITION_PRICE_OPEN ); }
+double   PositionStopLoss() { return PositionGetDouble( POSITION_SL ); }
+string   PositionSymbol() { return PositionGetString( POSITION_SYMBOL ); }
+double   PositionTakeProfit() { return PositionGetDouble( POSITION_TP ); }
+long     PositionTicket() { return PositionGetInteger( POSITION_TICKET ); }
+datetime PositionTimeOpen() { return ( datetime )PositionGetInteger( POSITION_TIME ); }
+int      PositionType() { return ( int )PositionGetInteger( POSITION_TYPE ); }
+
+#endif
